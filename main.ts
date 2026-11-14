@@ -1,84 +1,68 @@
-// main.ts — entrypoint and env lifecycle: bind an ephemeral port, register it
-// with the trial env, then poll until the env says the trial is done and exit 0.
-// Never binds 8080; the env owns that port. Without MAKEFUN_ENV_URL there is
-// nothing to register with, so the program exits 1 at once.
-// The poll loop uses a short backoff so a slow env is retried, never waited on.
-
+// main.ts — entrypoint and trial lifecycle:
+//  1. bind an ephemeral port (never 8080),
+//  2. register it with POST $MAKEFUN_ENV_URL/register,
+//  3. poll GET $MAKEFUN_ENV_URL/done until it answers {"done":true},
+//  4. exit 0.
+// Without MAKEFUN_ENV_URL the process exits 1 at once. Failed register and
+// poll attempts are retried with a short exponential backoff.
+import { Store } from './store.ts';
 import { createApp } from './app.ts';
 
-const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
-if (ENV_URL === '') {
-  process.stderr.write('[entry] MAKEFUN_ENV_URL is not set: there is no env to register with\n');
+const envUrl = process.env.MAKEFUN_ENV_URL;
+if (!envUrl) {
+  console.error('MAKEFUN_ENV_URL is not set');
   process.exit(1);
 }
 
-const REQUEST_TIMEOUT_MS = 30_000;
-const RETRY_INITIAL_MS = 250;
-const RETRY_MAX_MS = 2_000;
+const token = process.env.MAKEFUN_SHOP_TOKEN ?? null;
+const store = new Store();
+const server = createApp(store, token);
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function retryDelay(attempt: number): number {
-  return Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * 2 ** Math.min(attempt, 8));
-}
-
-/** POST the bound port until the env accepts it (200) or reports a first register won (409). */
 async function register(port: number): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
+  const base = envUrl.replace(/\/$/, '');
+  let delay = 100;
+  for (;;) {
     try {
-      const res = await fetch(`${ENV_URL}/register`, {
+      const res = await fetch(`${base}/register`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ port }),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        signal: AbortSignal.timeout(5000),
       });
-      if (res.status === 200 || res.status === 409) return;
-      if (res.status === 400 || res.status === 405) throw new Error(`register answered HTTP ${res.status}: ${await res.text()}`);
-    } catch (err) {
-      if (err instanceof Error && err.message.startsWith('register answered HTTP ')) throw err;
-    }
-    await sleep(retryDelay(attempt));
-  }
-}
-
-/** Poll GET /done until it answers {"done": true}; never return before that. */
-async function waitForDone(): Promise<void> {
-  for (let attempt = 0; ; attempt += 1) {
-    try {
-      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
-      if (res.ok) {
-        const body = (await res.json()) as { done?: unknown };
-        if (body.done === true) return;
-      }
+      if (res.status === 200 || res.status === 409) return; // 409: the first register already won; the base URL is set, so proceed to polling.
     } catch {
-      // The env is not answering yet, or the poll timed out: not done, poll again.
+      // fall through to retry
     }
-    await sleep(retryDelay(attempt));
+    await sleep(delay);
+    delay = Math.min(delay * 2, 2000);
   }
 }
 
-async function main(): Promise<void> {
-  const server = createApp();
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, () => resolve());
-  });
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server did not bind an ephemeral TCP port');
-  process.stdout.write(`[entry] listening on port ${address.port}\n`);
-
-  await register(address.port);
-  process.stdout.write('[entry] registered; waiting for the env to say done\n');
-
-  await waitForDone();
-  server.close();
-  process.stdout.write('[entry] done\n');
+async function pollDone(): Promise<void> {
+  const base = envUrl.replace(/\/$/, '');
+  let delay = 100;
+  for (;;) {
+    try {
+      const res = await fetch(`${base}/done`, { signal: AbortSignal.timeout(5000) });
+      const body = (await res.json()) as { done?: boolean };
+      if (body && body.done === true) return;
+    } catch {
+      // fall through to retry
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 1.5, 1000);
+  }
 }
 
-try {
-  await main();
-  process.exit(0);
-} catch (err) {
-  process.stderr.write(`[entry] ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
-}
+server.listen(0, '0.0.0.0', () => {
+  const addr = server.address();
+  const port = typeof addr === 'object' && addr !== null ? addr.port : 0;
+  void (async () => {
+    await register(port);
+    await pollDone();
+    server.close();
+    setTimeout(() => process.exit(0), 200);
+  })();
+});

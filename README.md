@@ -1,37 +1,62 @@
 # forge — a standalone GitHub-compatible git forge
 
-One process, Node 22 standard library only, that serves git smart HTTP
-(protocol v2 and v0), the REST v3 API, GraphQL and MCP from its own
-in-memory store. No UI, no git binary, no outside service.
+One process, no dependencies beyond the Node 22 standard library, no git
+binary, no outside service. It serves from its own in-memory store:
 
-## Run
+- git smart HTTP at `/{owner}/{repo}.git` — upload-pack protocol v2 and v0,
+  receive-pack v0, with its own object store (zlib), packfile read (with
+  delta application) and write (full objects)
+- the REST v3 API under `/api/v3` — repositories, contents, labels, issues,
+  comments, branches, commits, git refs, pull requests and squash merges
+- GraphQL at `/api/graphql` — repository/issue/pull-request queries, the
+  create/close/merge mutations, batch bodies and `__type`/`__schema`
+  introspection
+- MCP at `/mcp` — JSON-RPC 2.0 over Streamable HTTP, revision 2026-07-28,
+  with `create_repo`, `get_repo`, `create_issue`, `list_issues`,
+  `create_pull_request` and `merge_pull_request` tools acting on the same
+  store as REST
 
-The trial harness runs `node main.ts`. The program binds an ephemeral port
-of its own, registers it with the env at `$MAKEFUN_ENV_URL`, serves until the
-env answers `{"done": true}` on `/done`, then exits 0. It never binds 8080.
-`$MAKEFUN_SHOP_TOKEN` is the bearer token every API request must carry.
+## Running
+
+```
+node main.ts
+```
+
+The process needs `MAKEFUN_ENV_URL` (the trial environment base URL) and
+`MAKEFUN_SHOP_TOKEN` (the bearer token it accepts). It binds an ephemeral
+port, registers it with `POST $MAKEFUN_ENV_URL/register`, serves, and polls
+`GET $MAKEFUN_ENV_URL/done` until the suite is finished, then exits 0.
+Without `MAKEFUN_ENV_URL` it exits 1 at once. It never binds port 8080.
 
 ## Layout
 
-- `main.ts` — entrypoint and env lifecycle (bind, register, poll done, exit).
-- `app.ts` — the HTTP server: routing, auth, JSON body parsing, request ids.
-- `store.ts` — the in-memory store: git objects, repos, refs, issues, pulls.
-- `git.ts` — git plumbing: objects, packfiles, pkt-line framing, smart HTTP
-  (upload-pack v2/v0, receive-pack v0), shallow/deepen support.
-- `rest.ts` — the GitHub REST v3 API under `/api/v3`.
-- `graphql.ts` — the GraphQL API at `/api/graphql` (parser, validator,
-  executor, introspection).
-- `mcp.ts` — the MCP endpoint at `/mcp` (JSON-RPC 2.0, Streamable HTTP).
+- `main.ts` — entrypoint and trial lifecycle (bind, register, poll, exit)
+- `app.ts` — HTTP server and routing, auth, JSON envelope
+- `store.ts` — in-memory store: repos, git objects, trees, commits, issues,
+  pull requests, labels, three-way merge and squash merge
+- `git.ts` — pkt-line framing, packfile read/write, upload-pack v0/v2 and
+  receive-pack v0
+- `rest.ts` — REST v3 handlers
+- `graphql.ts` — GraphQL parser and executor
+- `mcp.ts` — MCP tools
+
+## Verifying locally
+
+The local test client (kept next to the repo, not part of the entry) boots
+the forge against a fake trial environment and exercises REST, git,
+GraphQL, MCP and the four workloads at small scale — 119 checks in total:
+
+```
+node ../test-client.mjs
+```
 
 ## Notes
 
-- Repositories are created through REST; a push cannot invent one.
-- Every push must fast-forward; a non-fast-forward update is refused per ref
+- All state is in memory; nothing is synced to disk on the request path.
+- Times in stored state are deterministic (a fixed base plus a counter), so
+  two runs over the same operations leave the same state.
+- Every push must fast-forward; a non-fast-forward ref is refused per ref
   with `ng <ref> non-fast-forward` and the ref does not move.
-- State is deterministic: timestamps the forge itself invents are fixed, so
-  two runs on the same input leave the same state. The same holds for the
-  commit objects the forge creates for REST content writes: they carry a
-  fixed author timestamp, so their ids are reproducible too.
-- The forge is single-tenant: the owner login is learned from the first
-  repo-scoped request that names an existing repository, and a different
-  owner asking for the same repository name gets a 404, never a 403.
+- A repository is created through REST; a push cannot invent one. A
+  repository belongs to the login the bearer token names; the same name
+  under another owner is 404, never 403.
