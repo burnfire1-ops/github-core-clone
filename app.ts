@@ -1,185 +1,160 @@
-// app.ts — one HTTP server: git smart HTTP at /{owner}/{repo}.git, REST v3
-// under /api/v3, GraphQL at /api/graphql, MCP at /mcp, and a no-auth
-// /healthz. Every REST/GraphQL/MCP reply is JSON with a non-empty
-// X-GitHub-Request-Id header; git replies are pkt-line framed.
-import http from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Store } from './store.ts';
+import { handleGit } from './git.ts';
 import { handleRest } from './rest.ts';
 import { handleGraphql } from './graphql.ts';
 import { handleMcp } from './mcp.ts';
-import { gitInfoRefs, gitReceivePack, gitUploadPack } from './git.ts';
 
-const MAX_BODY = 512 * 1024 * 1024;
+// app.ts — one HTTP server, four surfaces: REST v3, GraphQL, MCP and git
+// smart HTTP, all over the same in-memory store.
 
-function readBody(req: http.IncomingMessage): Promise<Buffer> {
+export function createForgeServer(token: string) {
+  const store = new Store();
+  const server = createServer((req, res) => {
+    handle(req, res, store, token).catch((err) => {
+      try {
+        res.writeHead(500, { 'content-type': 'application/json', 'x-github-request-id': store.nextRequestId() });
+        res.end(JSON.stringify({ message: err instanceof Error ? err.message : 'Internal Server Error' }));
+      } catch {
+        // response already gone
+      }
+    });
+  });
+  // OPT-9: no Nagle delay on accepted sockets, long keep-alive so the
+  // read workload's single connection stays open, headers timeout just
+  // above the keep-alive timeout.
+  server.keepAliveTimeout = 65000;
+  server.headersTimeout = 66000;
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
+  });
+  return server;
+}
+
+function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (c: Buffer) => {
-      total += c.length;
-      if (total > MAX_BODY) {
-        reject(new Error('body too large'));
-        return;
-      }
-      chunks.push(c);
-    });
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
-  const headers: Record<string, string> = {
-    'content-type': 'application/json',
-    'x-github-request-id': randomUUID(),
-    ...(extraHeaders ?? {}),
-  };
-  if (status === 204 || body === null || body === undefined) {
-    res.writeHead(status, headers);
+function sendJson(res: ServerResponse, store: Store, status: number, body: string | null, headers: Record<string, string> = {}): void {
+  const out: Record<string, string> = { 'content-type': 'application/json', 'x-github-request-id': store.nextRequestId(), ...headers };
+  if (body === null) {
+    res.writeHead(status, out);
     res.end();
     return;
   }
-  const payload = Buffer.from(JSON.stringify(body), 'utf8');
-  headers['content-length'] = String(payload.length);
-  res.writeHead(status, headers);
-  res.end(payload);
+  out['content-length'] = String(Buffer.byteLength(body));
+  res.writeHead(status, out);
+  res.end(body);
 }
 
-async function handleRequest(store: Store, expectedToken: string | null, req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
+async function handle(req: IncomingMessage, res: ServerResponse, store: Store, token: string): Promise<void> {
+  const rawUrl = req.url ?? '/';
+  const url = new URL(rawUrl, 'http://localhost');
+  const method = (req.method ?? 'GET').toUpperCase();
+  const segments = url.pathname.split('/').filter((s) => s.length > 0).map((s) => {
+    try {
+      return decodeURIComponent(s);
+    } catch {
+      return s;
+    }
+  });
   const host = req.headers.host ?? 'localhost';
-  const url = new URL(req.url ?? '/', `http://${host}`);
-  const method = req.method ?? 'GET';
-  const pathname = url.pathname;
+  store.baseUrl = 'http://' + host;
 
-  if (method === 'GET' && pathname === '/healthz') {
-    sendJson(res, 200, { ok: true });
+  // Health check: no auth.
+  if (method === 'GET' && url.pathname === '/healthz') {
+    sendJson(res, store, 200, JSON.stringify({ ok: true }));
     return;
   }
 
-  // Git smart HTTP carries no bearer token (the git CLI sends none), so the
-  // forge's git endpoints are unauthenticated by design; the repository is
-  // still resolved against the learned owner login.
-  const gitMatch = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(pathname);
-  if (gitMatch) {
-    const owner = decodeURIComponent(gitMatch[1]);
-    const repoName = decodeURIComponent(gitMatch[2]);
-    const rest = gitMatch[3] ?? '';
-    const gitProtocol = req.headers['git-protocol'] ?? '';
-    if (method === 'GET' && rest === '/info/refs') {
-      const r = gitInfoRefs(store, owner, repoName, url.searchParams.get('service') ?? '', gitProtocol);
-      if (r.contentType === 'application/json') {
-        sendJson(res, r.status, JSON.parse(r.body.toString('utf8')));
-        return;
-      }
-      res.writeHead(r.status, {
-        'content-type': r.contentType,
-        'content-length': String(r.body.length),
-        'cache-control': 'no-cache, max-age=0, must-revalidate',
-        pragma: 'no-cache',
-        expires: 'Fri, 01 Jan 1980 00:00:00 GMT',
-      });
-      res.end(r.body);
-      return;
-    }
-    if (method === 'POST' && rest === '/git-upload-pack') {
-      const body = await readBody(req);
-      const r = gitUploadPack(store, owner, repoName, body, gitProtocol);
-      if (r.contentType === 'application/json') {
-        sendJson(res, r.status, JSON.parse(r.body.toString('utf8')));
-        return;
-      }
-      res.writeHead(r.status, { 'content-type': r.contentType, 'content-length': String(r.body.length) });
-      res.end(r.body);
-      return;
-    }
-    if (method === 'POST' && rest === '/git-receive-pack') {
-      const body = await readBody(req);
-      const r = gitReceivePack(store, owner, repoName, body);
-      if (r.contentType === 'application/json') {
-        sendJson(res, r.status, JSON.parse(r.body.toString('utf8')));
-        return;
-      }
-      res.writeHead(r.status, { 'content-type': r.contentType, 'content-length': String(r.body.length) });
-      res.end(r.body);
-      return;
-    }
-    sendJson(res, 404, { message: 'Not Found' });
+  // Git smart HTTP: no auth (the git CLI carries no bearer token).
+  if (segments.length >= 2 && segments[1].endsWith('.git')) {
+    const owner = segments[0];
+    const repoName = segments[1].slice(0, -'.git'.length);
+    const rest = segments.slice(2);
+    const body = method === 'POST' ? await readBody(req) : Buffer.alloc(0);
+    const headers: Record<string, string | undefined> = {};
+    for (const [k, v] of Object.entries(req.headers)) headers[k.toLowerCase()] = Array.isArray(v) ? v[0] : v;
+    const result = handleGit(store, method, owner, repoName, rest, url.searchParams, headers, body);
+    const out: Record<string, string> = { ...result.headers };
+    if (!out['content-type']) out['content-type'] = 'application/octet-stream';
+    res.writeHead(result.status, out);
+    res.end(result.body);
     return;
   }
 
-  // MCP: DELETE answers 200 without auth; POST needs the token.
-  if (pathname === '/mcp') {
-    if (method === 'DELETE') {
-      sendJson(res, 200, {});
+  // Authenticated surfaces.
+  const needsAuth = segments[0] === 'api' || segments[0] === 'mcp';
+  if (needsAuth) {
+    const auth = req.headers.authorization ?? '';
+    if (auth !== 'Bearer ' + token) {
+      sendJson(res, store, 401, JSON.stringify({ message: 'Requires authentication' }));
       return;
     }
-    if (method === 'POST') {
-      if (expectedToken !== null && req.headers.authorization !== `Bearer ${expectedToken}`) {
-        sendJson(res, 401, { message: 'Bad credentials' });
-        return;
-      }
-      const body = await readBody(req);
-      const r = handleMcp(store, body.length === 0 ? null : body.toString('utf8'), host);
-      if (r.status === 202 || r.body === null) {
-        res.writeHead(r.status, { 'x-github-request-id': randomUUID(), ...(r.headers ?? {}) });
-        res.end();
-        return;
-      }
-      sendJson(res, r.status, r.body, r.headers);
-      return;
-    }
-    sendJson(res, 405, { message: 'Method Not Allowed' });
-    return;
   }
 
-  // GraphQL
-  if (pathname === '/api/graphql') {
+  if (segments[0] === 'api' && segments[1] === 'graphql') {
     if (method !== 'POST') {
-      sendJson(res, 404, { message: 'Not Found' });
+      sendJson(res, store, 404, JSON.stringify({ message: 'Not Found' }));
       return;
     }
-    if (expectedToken !== null && req.headers.authorization !== `Bearer ${expectedToken}`) {
-      sendJson(res, 401, { message: 'Bad credentials' });
+    const raw = await readBody(req);
+    let parsed: unknown = null;
+    try {
+      parsed = raw.length > 0 ? JSON.parse(raw.toString('utf8')) : null;
+    } catch {
+      sendJson(res, store, 400, JSON.stringify({ message: 'Invalid JSON' }));
       return;
     }
-    const body = await readBody(req);
-    const r = handleGraphql(store, body.length === 0 ? null : body.toString('utf8'), host);
-    sendJson(res, r.status, r.body);
+    const result = handleGraphql(store, parsed);
+    sendJson(res, store, result.status, result.body);
     return;
   }
 
-  // REST v3
-  if (pathname === '/api/v3' || pathname.startsWith('/api/v3/')) {
-    if (expectedToken !== null && req.headers.authorization !== `Bearer ${expectedToken}`) {
-      sendJson(res, 401, { message: 'Bad credentials' });
-      return;
-    }
-    const hasBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
-    const body = hasBody ? await readBody(req) : null;
-    const r = handleRest(store, method, pathname, url, body && body.length > 0 ? body.toString('utf8') : null, host);
-    if (r.status === 204 || r.body === null) {
-      res.writeHead(204, { 'x-github-request-id': randomUUID(), ...(r.headers ?? {}) });
+  if (segments[0] === 'mcp') {
+    const raw = await readBody(req);
+    const result = handleMcp(store, method, raw);
+    if (result.body === null) {
+      res.writeHead(result.status, result.headers);
       res.end();
       return;
     }
-    sendJson(res, r.status, r.body, r.headers);
+    sendJson(res, store, result.status, result.body, result.headers);
     return;
   }
 
-  sendJson(res, 404, { message: 'Not Found' });
-}
-
-export function createApp(store: Store, expectedToken: string | null): http.Server {
-  const server = http.createServer((req, res) => {
-    handleRequest(store, expectedToken, req, res).catch((e: Error) => {
-      console.error('request error:', e.message);
-      if (!res.headersSent) {
-        sendJson(res, 500, { message: 'Internal error' });
-      } else {
-        res.end();
+  if (segments[0] === 'api' && segments[1] === 'v3') {
+    const restSegments = segments.slice(2);
+    let parsedBody: Record<string, unknown> | null = null;
+    if (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE') {
+      const raw = await readBody(req);
+      if (raw.length > 0) {
+        try {
+          const parsed: unknown = JSON.parse(raw.toString('utf8'));
+          parsedBody = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : null;
+        } catch {
+          sendJson(res, store, 400, JSON.stringify({ message: 'Invalid JSON' }));
+          return;
+        }
       }
+    }
+    const result = handleRest(store, {
+      method,
+      segments: restSegments,
+      path: url.pathname,
+      query: url.searchParams,
+      body: parsedBody,
+      baseUrl: store.baseUrl,
     });
-  });
-  return server;
+    sendJson(res, store, result.status, result.body, result.headers);
+    return;
+  }
+
+  sendJson(res, store, 404, JSON.stringify({ message: 'Not Found' }));
 }

@@ -1,740 +1,843 @@
-// git.ts — git objects over the wire: pkt-line framing, packfile read/write
-// (full objects only; no delta encoding on write), delta application on
-// read, and the smart-HTTP handlers for upload-pack (v0 + v2) and
-// receive-pack (v0). All behaviour here was derived from the protocol and
-// verified against the git 2.43 client.
+import { inflateSync, deflateSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
-import type { Store, Repo, ObjectType } from './store.ts';
-import { hashObject, parseTag, parseTree } from './store.ts';
+import type { Repo, ObjType } from './store.ts';
+import { getObject, putObject, parseTree, parseCommit, treeOfCommit } from './store.ts';
 
-export const ZERO_OID = '0000000000000000000000000000000000000000';
+// git.ts — pkt-line framing, packfile read/write, smart HTTP
+// (upload-pack v0 + v2, receive-pack v0).
 
-// ---------------------------------------------------------------- pkt-line
-export function pktLine(s: string): Buffer {
-  const body = Buffer.from(s, 'utf8');
-  return Buffer.concat([Buffer.from((body.length + 4).toString(16).padStart(4, '0'), 'ascii'), body]);
+export function pktLine(data: Buffer | string): Buffer {
+  const body = typeof data === 'string' ? Buffer.from(data, 'utf8') : data;
+  const len = body.length + 4;
+  return Buffer.concat([Buffer.from(len.toString(16).padStart(4, '0'), 'ascii'), body]);
 }
 
 export const FLUSH = Buffer.from('0000', 'ascii');
-export const DELIM = Buffer.from('0001', 'ascii');
 
 export interface PktItem {
-  kind: 'line' | 'flush' | 'delim' | 'end';
-  text?: string;
+  flush: boolean;
+  data: Buffer | null;
 }
 
-export function parsePktLines(buf: Buffer): { items: PktItem[]; afterFirstFlush: number | null } {
+// Parse pkt-lines from buf starting at `start`. Stops at the first
+// malformed line or at the end of the buffer. Returns the items and the
+// offset just past the last complete line.
+export function parsePktLines(buf: Buffer, start = 0): { items: PktItem[]; end: number } {
   const items: PktItem[] = [];
-  let off = 0;
-  let afterFirstFlush: number | null = null;
-  while (off + 4 <= buf.length) {
-    const lenHex = buf.subarray(off, off + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(lenHex)) break;
-    const n = parseInt(lenHex, 16);
-    if (n === 0) {
-      items.push({ kind: 'flush' });
-      if (afterFirstFlush === null) afterFirstFlush = off + 4;
-      off += 4;
+  let i = start;
+  while (i + 4 <= buf.length) {
+    const lenText = buf.subarray(i, i + 4).toString('ascii');
+    const len = parseInt(lenText, 16);
+    if (Number.isNaN(len)) break;
+    if (len === 0) {
+      items.push({ flush: true, data: null });
+      i += 4;
       continue;
     }
-    if (n === 1) {
-      items.push({ kind: 'delim' });
-      off += 4;
-      continue;
-    }
-    if (n === 2) {
-      items.push({ kind: 'end' });
-      off += 4;
-      continue;
-    }
-    if (n < 4 || off + n > buf.length) break;
-    items.push({ kind: 'line', text: buf.subarray(off + 4, off + n).toString('utf8') });
-    off += n;
+    if (len < 4 || i + len > buf.length) break;
+    items.push({ flush: false, data: buf.subarray(i + 4, i + len) });
+    i += len;
   }
-  return { items, afterFirstFlush };
+  return { items, end: i };
 }
 
-// Side-band-64k framing: each chunk is a pkt-line whose payload starts with
-// the band byte 0x01 followed by raw data.
-export function sideBand(data: Buffer): Buffer {
-  const chunks: Buffer[] = [];
-  const MAX = 65515;
-  for (let off = 0; off < data.length; off += MAX) {
-    const slice = data.subarray(off, Math.min(off + MAX, data.length));
-    const payload = Buffer.concat([Buffer.from([0x01]), slice]);
-    chunks.push(Buffer.concat([Buffer.from((payload.length + 4).toString(16).padStart(4, '0'), 'ascii'), payload]));
+// OPT-1: inflate a deflate stream exactly once and read how many input
+// bytes the inflater consumed (inflateSync with {info:true} exposes the
+// engine's bytesWritten, which is the consumed input length). Falls back
+// to the probe-and-search method if that capability is unavailable.
+export function inflateOnce(buf: Buffer, start: number): { data: Buffer; end: number } {
+  const slice = buf.subarray(start);
+  try {
+    const res = inflateSync(slice, { info: true }) as unknown as { buffer: Buffer; engine: { bytesWritten: number } };
+    const consumed = res.engine && res.engine.bytesWritten;
+    if (typeof consumed === 'number' && consumed > 0) return { data: res.buffer, end: start + consumed };
+  } catch {
+    // fall through to the probe method
   }
-  return Buffer.concat(chunks);
-}
-
-// ---------------------------------------------------------------- packfiles
-const TYPE_CODES: Record<ObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-const CODE_TYPES: Array<ObjectType | ''> = ['', 'commit', 'tree', 'blob', 'tag'];
-
-export function writePack(objs: Array<{ type: ObjectType; content: Buffer }>): Buffer {
-  const parts: Buffer[] = [];
-  const head = Buffer.alloc(12);
-  head.write('PACK', 0, 'ascii');
-  head.writeUInt32BE(2, 4);
-  head.writeUInt32BE(objs.length, 8);
-  parts.push(head);
-  for (const o of objs) {
-    const deflated = deflateSync(o.content);
-    const typeCode = TYPE_CODES[o.type];
-    const size = o.content.length;
-    const headerBytes: number[] = [];
-    let b0 = (typeCode << 4) | (size & 0x0f);
-    let rest = size >> 4;
-    if (rest > 0) b0 |= 0x80;
-    headerBytes.push(b0);
-    while (rest > 0) {
-      let b = rest & 0x7f;
-      rest >>= 7;
-      if (rest > 0) b |= 0x80;
-      headerBytes.push(b);
-    }
-    parts.push(Buffer.from(headerBytes));
-    parts.push(deflated);
-  }
-  const withoutTrailer = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(withoutTrailer).digest();
-  return Buffer.concat([withoutTrailer, trailer]);
-}
-
-// Inflate one deflate stream starting at `start`; returns the data and the
-// exact end offset (found by exponential probe + binary search, since
-// inflateSync ignores trailing bytes and reports no consumed length).
-function inflateOne(buf: Buffer, start: number): { data: Buffer; end: number } {
-  let failEnd = start;
-  let hi = Math.min(buf.length, start + 16);
-  for (;;) {
+  let lo = 1;
+  let hi = 1;
+  while (hi <= slice.length) {
     try {
-      inflateSync(buf.subarray(start, hi));
+      inflateSync(slice.subarray(0, hi));
       break;
     } catch {
-      failEnd = hi;
-      if (hi >= buf.length) throw new Error('truncated deflate stream in pack');
-      hi = Math.min(buf.length, hi * 2);
+      hi *= 2;
     }
   }
-  let lo = failEnd + 1;
-  let hiOk = hi;
-  while (lo < hiOk) {
-    const mid = (lo + hiOk) >> 1;
+  if (hi > slice.length) hi = slice.length;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
     try {
-      inflateSync(buf.subarray(start, mid));
-      hiOk = mid;
+      inflateSync(slice.subarray(0, mid));
+      hi = mid;
     } catch {
       lo = mid + 1;
     }
   }
-  return { data: inflateSync(buf.subarray(start, hiOk)), end: hiOk };
+  return { data: inflateSync(slice.subarray(0, lo)), end: start + lo };
 }
 
-function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let p = 0;
-  const readVarint = (): number => {
-    let v = 0;
-    let s = 0;
-    let b = 0;
-    do {
-      b = delta[p++];
-      v |= (b & 0x7f) << s;
-      s += 7;
-    } while (b & 0x80);
-    return v;
-  };
-  const srcSize = readVarint();
-  const tgtSize = readVarint();
-  if (srcSize !== base.length) throw new Error('delta base size mismatch');
-  const out: Buffer[] = [];
-  while (p < delta.length) {
-    const op = delta[p++];
+function readVarint(buf: Buffer, off: number): { value: number; next: number } {
+  let value = 0;
+  let shift = 0;
+  let i = off;
+  for (;;) {
+    const b = buf[i];
+    value |= (b & 0x7f) << shift;
+    shift += 7;
+    i += 1;
+    if ((b & 0x80) === 0) break;
+  }
+  return { value, next: i };
+}
+
+export function applyDelta(base: Buffer, delta: Buffer): Buffer {
+  let off = 0;
+  const src = readVarint(delta, off);
+  off = src.next;
+  const tgt = readVarint(delta, off);
+  off = tgt.next;
+  if (src.value !== base.length) throw new Error('delta source size mismatch');
+  const out = Buffer.alloc(tgt.value);
+  let outPos = 0;
+  while (off < delta.length) {
+    const op = delta[off];
+    off += 1;
     if (op & 0x80) {
-      let off = 0;
-      let size = 0;
-      if (op & 0x01) off = delta[p++];
-      if (op & 0x02) off |= delta[p++] << 8;
-      if (op & 0x04) off |= delta[p++] << 16;
-      if (op & 0x08) off |= delta[p++] << 24;
-      if (op & 0x10) size = delta[p++];
-      if (op & 0x20) size |= delta[p++] << 8;
-      if (op & 0x40) size |= delta[p++] << 16;
-      if (size === 0) size = 0x10000;
-      out.push(base.subarray(off, off + size));
+      let cpOff = 0;
+      let cpSize = 0;
+      for (let bit = 0; bit < 4; bit += 1) {
+        if (op & (1 << bit)) {
+          cpOff |= delta[off] << (bit * 8);
+          off += 1;
+        }
+      }
+      for (let bit = 0; bit < 3; bit += 1) {
+        if (op & (0x10 << bit)) {
+          cpSize |= delta[off] << (bit * 8);
+          off += 1;
+        }
+      }
+      if (cpSize === 0) cpSize = 0x10000;
+      base.copy(out, outPos, cpOff, cpOff + cpSize);
+      outPos += cpSize;
     } else if (op !== 0) {
-      out.push(delta.subarray(p, p + op));
-      p += op;
+      delta.copy(out, outPos, off, off + op);
+      outPos += op;
+      off += op;
     } else {
       throw new Error('delta op 0');
     }
   }
-  const res = Buffer.concat(out);
-  if (res.length !== tgtSize) throw new Error('delta target size mismatch');
-  return res;
+  if (outPos !== tgt.value) throw new Error('delta target size mismatch');
+  return out;
 }
 
-export interface PackObject {
-  oid: string;
-  type: ObjectType;
-  content: Buffer;
+const TYPE_CODES: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+const TYPE_NUMBERS: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
+
+interface PackEntry {
+  offset: number;
+  type: ObjType | 'ofs-delta' | 'ref-delta';
+  data: Buffer;
+  baseOffset: number | null;
+  baseOid: string | null;
 }
 
-export function readPack(
-  buf: Buffer,
-  getObject: (oid: string) => { type: ObjectType; content: Buffer } | null,
-): PackObject[] {
-  if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') {
-    throw new Error('bad pack header');
-  }
-  const version = buf.readUInt32BE(4);
+// Read a packfile, resolve deltas, store every object (uncompressed, per
+// OPT-2) and return the oids of the objects it contained.
+export function readPack(repo: Repo, buf: Buffer): string[] {
+  if (buf.length < 12 || buf.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('not a packfile');
   const count = buf.readUInt32BE(8);
-  if (version !== 2 && version !== 3) throw new Error('unsupported pack version');
-  interface RawEntry {
-    offset: number;
-    type: number;
-    data: Buffer;
-    baseOid?: string;
-    baseOffset?: number;
-    resolved?: PackObject;
-    resolving?: boolean;
-  }
-  const entries: RawEntry[] = [];
+  const entries: PackEntry[] = [];
+  const byOffset = new Map<number, PackEntry>();
   let off = 12;
-  for (let i = 0; i < count; i += 1) {
-    const entryStart = off;
-    let b = buf[off++];
-    const type = (b >> 4) & 0x07;
-    let size = b & 0x0f;
+  for (let n = 0; n < count; n += 1) {
+    const entryOffset = off;
+    let b = buf[off];
+    off += 1;
+    const typeNum = (b >> 4) & 7;
+    let size = b & 15;
     let shift = 4;
     while (b & 0x80) {
-      b = buf[off++];
+      b = buf[off];
+      off += 1;
       size |= (b & 0x7f) << shift;
       shift += 7;
     }
-    void size;
-    const e: RawEntry = { offset: entryStart, type, data: Buffer.alloc(0) };
-    if (type === 6) {
-      let by = buf[off++];
-      let offset = by & 0x7f;
-      while (by & 0x80) {
-        by = buf[off++];
-        offset = ((offset + 1) << 7) | (by & 0x7f);
+    let baseOffset: number | null = null;
+    let baseOid: string | null = null;
+    let type: ObjType | 'ofs-delta' | 'ref-delta';
+    if (typeNum === 6) {
+      type = 'ofs-delta';
+      b = buf[off];
+      off += 1;
+      let deltaOff = b & 0x7f;
+      while (b & 0x80) {
+        b = buf[off];
+        off += 1;
+        deltaOff = ((deltaOff + 1) << 7) | (b & 0x7f);
       }
-      e.baseOffset = entryStart - offset;
-    } else if (type === 7) {
-      e.baseOid = buf.subarray(off, off + 20).toString('hex');
+      baseOffset = entryOffset - deltaOff;
+    } else if (typeNum === 7) {
+      type = 'ref-delta';
+      baseOid = buf.subarray(off, off + 20).toString('hex');
       off += 20;
+    } else {
+      type = TYPE_CODES[typeNum];
+      if (!type) throw new Error('unknown pack object type ' + typeNum);
     }
-    const inflated = inflateOne(buf, off);
-    e.data = inflated.data;
+    const inflated = inflateOnce(buf, off);
     off = inflated.end;
-    entries.push(e);
+    const entry: PackEntry = { offset: entryOffset, type, data: inflated.data, baseOffset, baseOid };
+    entries.push(entry);
+    byOffset.set(entryOffset, entry);
   }
-  const byOffset = new Map<number, RawEntry>(entries.map((e) => [e.offset, e]));
-  const byOid = new Map<string, RawEntry>();
-  for (const e of entries) {
-    if (e.type >= 1 && e.type <= 4) {
-      const type = CODE_TYPES[e.type] as ObjectType;
-      byOid.set(hashObject(type, e.data), e);
-    }
-  }
-  const resolve = (e: RawEntry): PackObject => {
-    if (e.resolved) return e.resolved;
-    if (e.resolving) throw new Error('delta cycle in pack');
-    e.resolving = true;
-    try {
-      if (e.type >= 1 && e.type <= 4) {
-        const type = CODE_TYPES[e.type] as ObjectType;
-        e.resolved = { oid: hashObject(type, e.data), type, content: e.data };
-        return e.resolved;
-      }
-      let base: PackObject;
-      if (e.type === 6) {
-        const baseEntry = byOffset.get(e.baseOffset!);
-        if (!baseEntry) throw new Error('ofs-delta base not found in pack');
-        base = resolve(baseEntry);
-      } else if (e.type === 7) {
-        const baseEntry = byOid.get(e.baseOid!);
-        if (baseEntry) {
-          base = resolve(baseEntry);
-        } else {
-          const stored = getObject(e.baseOid!);
-          if (!stored) throw new Error('ref-delta base not found');
-          base = { oid: e.baseOid!, type: stored.type, content: stored.content };
-        }
+  const resolved = new Map<number, string>();
+  const resolve = (entry: PackEntry, depth: number): string => {
+    if (resolved.has(entry.offset)) return resolved.get(entry.offset) as string;
+    if (depth > 1000) throw new Error('delta chain too deep');
+    if (entry.type === 'ofs-delta' || entry.type === 'ref-delta') {
+      let baseRec: { type: ObjType; data: Buffer } | null = null;
+      let baseType: ObjType;
+      if (entry.baseOffset !== null) {
+        const baseEntry = byOffset.get(entry.baseOffset);
+        if (!baseEntry) throw new Error('delta base offset missing');
+        const baseOid = resolve(baseEntry, depth + 1);
+        baseRec = getObject(repo, baseOid);
+        if (!baseRec) throw new Error('delta base not stored');
+        baseType = baseRec.type;
       } else {
-        throw new Error(`unknown pack entry type ${e.type}`);
+        baseRec = getObject(repo, entry.baseOid as string);
+        if (!baseRec) throw new Error('thin pack base not in store: ' + entry.baseOid);
+        baseType = baseRec.type;
       }
-      const content = applyDelta(base.content, e.data);
-      e.resolved = { oid: hashObject(base.type, content), type: base.type, content };
-      return e.resolved;
-    } finally {
-      e.resolving = false;
+      const target = applyDelta(baseRec.data, entry.data);
+      const oid = putObject(repo, baseType, target);
+      resolved.set(entry.offset, oid);
+      return oid;
     }
+    const oid = putObject(repo, entry.type as ObjType, entry.data);
+    resolved.set(entry.offset, oid);
+    return oid;
   };
-  return entries.map((e) => resolve(e));
+  const oids: string[] = [];
+  for (const entry of entries) oids.push(resolve(entry, 0));
+  return oids;
+}
+
+function packObjectHeader(type: ObjType, size: number): Buffer {
+  const bytes: number[] = [];
+  let b = (TYPE_NUMBERS[type] << 4) | (size & 15);
+  size >>= 4;
+  while (size > 0) {
+    bytes.push(b | 0x80);
+    b = size & 0x7f;
+    size >>= 7;
+  }
+  bytes.push(b);
+  return Buffer.from(bytes);
 }
 
 // ---------------------------------------------------------------- fetch plan
+
 export interface FetchPlan {
-  objects: Array<{ type: ObjectType; content: Buffer }>;
+  objects: { oid: string; type: ObjType; data: Buffer }[];
   shallow: string[];
   unshallow: string[];
-  commonHaves: string[];
 }
 
-function planFetch(
-  store: Store,
+// Plan which objects a fetch sends. wants are commit oids the client asked
+// for, haves are commits it already has, depth limits history depth,
+// deepen extends history past the client's haves, clientShallow lists the
+// client's current shallow boundary commits.
+export function planFetch(
   repo: Repo,
-  opts: { wants: string[]; haves: string[]; shallowIn: string[]; deepen: number | null },
+  wants: string[],
+  haves: Set<string>,
+  depth: number | null,
+  deepen: number | null,
+  clientShallow: Set<string>,
 ): FetchPlan {
-  const wants = [...new Set(opts.wants)].filter((w) => w !== ZERO_OID);
-  const held = new Set([...opts.haves, ...opts.shallowIn]);
-  // A non-positive deepen makes no sense (git never sends one); treat it as no depth limit.
-  const deepen = opts.deepen !== null && opts.deepen > 0 ? opts.deepen : null;
-
-  // BFS from the wants, recording shortest depth. With no deepen, never
-  // expand past a commit the client already has. With deepen, expand
-  // through held commits so the walk can go below the shallow boundary.
-  const cap = deepen !== null && opts.shallowIn.length === 0 ? deepen - 1 : Infinity;
-  const depth = new Map<string, number>();
-  const queue: string[] = [];
-  for (const w of wants) {
-    if (!depth.has(w)) {
-      depth.set(w, 0);
-      queue.push(w);
+  // A deepen with no haves is a fresh shallow clone: depth = deepen.
+  if (deepen !== null && haves.size === 0) {
+    depth = deepen;
+    deepen = null;
+  }
+  // Distance from any have commit following parent links (Infinity when
+  // a commit is not reachable from any have).
+  const haveDist = new Map<string, number>();
+  {
+    const queue: { oid: string; dist: number }[] = [];
+    for (const have of haves) queue.push({ oid: have, dist: 0 });
+    while (queue.length > 0) {
+      const item = queue.shift() as { oid: string; dist: number };
+      if (haveDist.has(item.oid)) continue;
+      haveDist.set(item.oid, item.dist);
+      const parsed = parseCommit(repo, item.oid);
+      if (!parsed) continue;
+      for (const parent of parsed.parents) queue.push({ oid: parent, dist: item.dist + 1 });
     }
   }
-  let qi = 0;
-  while (qi < queue.length) {
-    const cur = queue[qi++];
-    const d = depth.get(cur)!;
-    if (d >= cap) continue;
-    if (deepen === null && held.has(cur)) continue;
-    const c = store.getCommit(repo, cur);
-    if (!c) continue;
-    for (const p of c.parents) {
-      if (!depth.has(p)) {
-        depth.set(p, d + 1);
-        queue.push(p);
+  // The set the client already holds: ancestors of its haves, stopping at
+  // its shallow boundary commits (their parents are precisely what a
+  // deepen fetch has to supply).
+  const heldSet = new Set<string>();
+  {
+    const stack: string[] = [...haves];
+    while (stack.length > 0) {
+      const oid = stack.pop() as string;
+      if (heldSet.has(oid)) continue;
+      heldSet.add(oid);
+      if (clientShallow.has(oid)) continue;
+      const parsed = parseCommit(repo, oid);
+      if (!parsed) continue;
+      for (const parent of parsed.parents) stack.push(parent);
+    }
+  }
+  const included = new Map<string, number>();
+  {
+    // Traversal and inclusion are separate: parents of an excluded commit
+    // may still be needed (e.g. the parent of a shallow have in a deepen
+    // fetch), so every visited commit's parents are enqueued.
+    const queue: { oid: string; dist: number }[] = [];
+    for (const want of wants) queue.push({ oid: want, dist: 0 });
+    const visited = new Set<string>();
+    while (queue.length > 0) {
+      const item = queue.shift() as { oid: string; dist: number };
+      if (visited.has(item.oid)) continue;
+      visited.add(item.oid);
+      let include = false;
+      if (deepen !== null) {
+        const dist = haveDist.get(item.oid);
+        include = dist === undefined || (dist >= 1 && dist <= deepen);
+      } else {
+        include = !heldSet.has(item.oid) && (depth === null || item.dist < depth);
+      }
+      if (include) included.set(item.oid, item.dist);
+      if (depth !== null && deepen === null && item.dist >= depth) continue;
+      const parsed = parseCommit(repo, item.oid);
+      if (!parsed) continue;
+      for (const parent of parsed.parents) queue.push({ oid: parent, dist: item.dist + 1 });
+    }
+  }
+  // Shallow boundary: included commits whose parents are not included and
+  // not already held by the client. The shallow file names the boundary
+  // commit itself, not its missing parent.
+  const shallow = new Set<string>();
+  for (const oid of included.keys()) {
+    const parsed = parseCommit(repo, oid);
+    if (!parsed) continue;
+    for (const parent of parsed.parents) {
+      if (!included.has(parent) && !heldSet.has(parent)) {
+        const rec = getObject(repo, parent);
+        if (rec && rec.type === 'commit') shallow.add(oid);
       }
     }
   }
-
-  let maxDepth: number | null = null;
-  if (deepen !== null) {
-    if (opts.shallowIn.length > 0) {
-      let base = 0;
-      for (const s of opts.shallowIn) {
-        const d = depth.get(s);
-        if (d !== undefined && d > base) base = d;
+  // Unshallow: client-shallow commits whose parents are now all present
+  // (in the pack or already held), with at least one parent newly supplied,
+  // or root commits.
+  const unshallow = new Set<string>();
+  const checkUnshallow = (oid: string): void => {
+    const parsed = parseCommit(repo, oid);
+    if (!parsed) return;
+    if (parsed.parents.length === 0) {
+      unshallow.add(oid);
+      return;
+    }
+    let newlySupplied = false;
+    for (const parent of parsed.parents) {
+      if (included.has(parent)) newlySupplied = true;
+      else if (!haves.has(parent)) return;
+    }
+    if (newlySupplied) unshallow.add(oid);
+  };
+  for (const oid of clientShallow) checkUnshallow(oid);
+  if (clientShallow.size === 0) {
+    for (const oid of haves) {
+      const parsed = parseCommit(repo, oid);
+      if (!parsed || parsed.parents.length === 0) continue;
+      let newlySupplied = false;
+      let allPresent = true;
+      for (const parent of parsed.parents) {
+        if (included.has(parent)) newlySupplied = true;
+        else if (!heldSet.has(parent)) allPresent = false;
       }
-      maxDepth = base + deepen;
-    } else {
-      maxDepth = deepen - 1;
+      if (newlySupplied && allPresent) unshallow.add(oid);
     }
   }
-
-  const included = new Set<string>();
-  for (const [oid, d] of depth) {
-    if (maxDepth !== null && d > maxDepth) continue;
-    if (held.has(oid)) continue;
-    included.add(oid);
-  }
-
-  const shallow: string[] = [];
-  const unshallow: string[] = [];
-  if (maxDepth !== null) {
-    for (const oid of included) {
-      if (depth.get(oid) !== maxDepth) continue;
-      const c = store.getCommit(repo, oid);
-      if (c && c.parents.length > 0) shallow.push(oid);
-    }
-    for (const s of opts.shallowIn) {
-      if (included.has(s)) continue;
-      const c = store.getCommit(repo, s);
-      if (c && c.parents.some((p) => included.has(p))) unshallow.push(s);
-    }
-  }
-
-  // Common haves: a have the server also has as an ancestor of a want.
-  const ancestorSet = new Set<string>();
-  for (const w of wants) {
-    for (const a of store.commitAncestors(repo, w)) ancestorSet.add(a);
-  }
-  const commonHaves = opts.haves.filter((h) => wants.includes(h) || ancestorSet.has(h));
-
-  // Collect the objects to send.
-  const objects: Array<{ type: ObjectType; content: Buffer }> = [];
+  // Collect objects. OPT-3: a tree already collected in this plan is
+  // never walked again.
+  const objects: { oid: string; type: ObjType; data: Buffer }[] = [];
   const seen = new Set<string>();
-  const addObject = (oid: string): void => {
+  const treeVisited = new Set<string>();
+  const addObj = (oid: string): void => {
     if (seen.has(oid)) return;
-    const o = store.getObject(repo, oid);
-    if (!o) return;
+    const rec = getObject(repo, oid);
+    if (!rec) return;
     seen.add(oid);
-    objects.push(o);
+    objects.push({ oid, type: rec.type, data: rec.data });
   };
-  const addTree = (treeOid: string): void => {
-    const obj = store.getObject(repo, treeOid);
-    if (!obj || obj.type !== 'tree') return;
-    addObject(treeOid);
-    for (const e of parseTree(obj.content)) {
-      if (e.mode === '40000') addTree(e.oid);
-      else addObject(e.oid);
+  const walkTree = (treeOid: string): void => {
+    if (treeVisited.has(treeOid)) return;
+    treeVisited.add(treeOid);
+    addObj(treeOid);
+    const rec = getObject(repo, treeOid);
+    if (!rec || rec.type !== 'tree') return;
+    for (const entry of parseTree(rec.data)) {
+      if (entry.mode === '40000') walkTree(entry.oid);
+      else addObj(entry.oid);
     }
   };
-  for (const oid of included) {
-    addObject(oid);
-    const c = store.getCommit(repo, oid);
-    if (c) addTree(c.tree);
+  for (const oid of included.keys()) {
+    addObj(oid);
+    const tree = treeOfCommit(repo, oid);
+    if (tree) walkTree(tree);
   }
-  for (const w of wants) {
-    const o = store.getObject(repo, w);
-    if (!o || o.type === 'commit') continue;
-    if (o.type === 'tree') addTree(w);
-    else if (o.type === 'blob') addObject(w);
-    else if (o.type === 'tag') {
-      addObject(w);
-      const t = parseTag(o.content);
-      if (t.object) addObject(t.object);
-    }
-  }
-  return { objects, shallow, unshallow, commonHaves };
+  return { objects, shallow: [...shallow], unshallow: [...unshallow] };
 }
 
-// ---------------------------------------------------------------- adverts
-function sortedRefs(repo: Repo): Array<{ oid: string; name: string }> {
-  return [...repo.refs.entries()]
-    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
-    .map(([name, oid]) => ({ oid, name }));
-}
-
-function v0UploadAdvert(repo: Repo): Buffer {
-  const caps =
-    'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not ' +
-    `deepen-relative no-progress include-tag multi_ack_detailed no-done symref=HEAD:refs/heads/${repo.defaultBranch} ` +
-    'object-format=sha1 agent=forge/1.0';
-  const chunks: Buffer[] = [pktLine('# service=git-upload-pack\n'), FLUSH];
-  const head = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-  const refs = sortedRefs(repo);
-  if (!head && refs.length === 0) {
-    chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
-  } else {
-    const lines: Array<{ oid: string; name: string }> = [];
-    if (head) lines.push({ oid: head, name: 'HEAD' });
-    for (const r of refs) lines.push(r);
-    lines.forEach((r, i) => {
-      if (i === 0) chunks.push(pktLine(`${r.oid} ${r.name}\0${caps}\n`));
-      else chunks.push(pktLine(`${r.oid} ${r.name}\n`));
-    });
+// OPT-2: pack bytes are deflated at write time only, at level 1, from the
+// raw in-memory records.
+export function writePack(plan: FetchPlan): Buffer {
+  const parts: Buffer[] = [];
+  const header = Buffer.alloc(12);
+  header.write('PACK', 0, 'ascii');
+  header.writeUInt32BE(2, 4);
+  header.writeUInt32BE(plan.objects.length, 8);
+  parts.push(header);
+  for (const obj of plan.objects) {
+    parts.push(packObjectHeader(obj.type, obj.data.length));
+    parts.push(deflateSync(obj.data, { level: 1 }));
   }
-  chunks.push(FLUSH);
-  return Buffer.concat(chunks);
+  const body = Buffer.concat(parts);
+  // A packfile ends with the SHA-1 of everything before it.
+  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
 }
 
-function v0ReceiveAdvert(repo: Repo): Buffer {
-  const caps = 'report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta object-format=sha1 agent=forge/1.0';
-  const chunks: Buffer[] = [pktLine('# service=git-receive-pack\n'), FLUSH];
+// ---------------------------------------------------------------- refs
+
+import { Store, ancestorsSet, isAncestor, setRef, deleteRef } from './store.ts';
+
+export const ZERO_OID = '0000000000000000000000000000000000000000';
+
+// OPT-9: the sorted ref list is cached per repository and reused while
+// the ref version counter matches; every ref mutation bumps the counter.
+export function sortedRefs(repo: Repo): { oid: string; name: string }[] {
+  const cached = repo.sortedRefsCache;
+  if (cached && cached.version === repo.refVersion) return cached.refs;
+  const out = [...repo.refs.entries()].map(([name, oid]) => ({ oid, name }));
+  out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  repo.sortedRefsCache = { version: repo.refVersion, refs: out };
+  return out;
+}
+
+const UPLOAD_CAPS =
+  'multi_ack thin-pack side-band side-band-64k ofs-delta shallow deepen-since deepen-not deepen-relative no-progress include-tag multi_ack_detailed allow-tip-sha1-in-want allow-reachable-sha1-in-want no-done symref=HEAD:refs/heads/main object-format=sha1 agent=forge/1.0';
+const RECEIVE_CAPS = 'report-status report-status-v2 delete-refs side-band-64k quiet atomic ofs-delta agent=forge/1.0';
+
+function v0Advert(service: string, repo: Repo, caps: string): Buffer {
+  const parts: Buffer[] = [];
+  parts.push(pktLine('# service=' + service + '\n'));
+  parts.push(FLUSH);
   const refs = sortedRefs(repo);
   if (refs.length === 0) {
-    chunks.push(pktLine(`${ZERO_OID} capabilities^{}\0${caps}\n`));
+    parts.push(pktLine(ZERO_OID + ' capabilities^{}\0' + caps + '\n'));
   } else {
-    refs.forEach((r, i) => {
-      if (i === 0) chunks.push(pktLine(`${r.oid} ${r.name}\0${caps}\n`));
-      else chunks.push(pktLine(`${r.oid} ${r.name}\n`));
+    refs.forEach((ref, i) => {
+      if (i === 0) parts.push(pktLine(ref.oid + ' ' + ref.name + '\0' + caps + '\n'));
+      else parts.push(pktLine(ref.oid + ' ' + ref.name + '\n'));
     });
   }
-  chunks.push(FLUSH);
-  return Buffer.concat(chunks);
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
 }
 
 function v2Advert(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine('agent=forge/1.0\n'),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('server-option\n'),
-    pktLine('object-format=sha1\n'),
-    pktLine('object-info\n'),
-    FLUSH,
-  ]);
+  const parts: Buffer[] = [];
+  parts.push(pktLine('version 2\n'));
+  parts.push(pktLine('agent=forge/1.0\n'));
+  parts.push(pktLine('ls-refs=unborn\n'));
+  parts.push(pktLine('fetch=shallow wait-for-done filter\n'));
+  parts.push(pktLine('server-option\n'));
+  parts.push(pktLine('object-format=sha1\n'));
+  parts.push(pktLine('object-info\n'));
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
 }
 
-// ---------------------------------------------------------------- handlers
-export interface GitResponse {
+// ---------------------------------------------------------------- upload-pack
+
+function sidebandPack(pack: Buffer): Buffer {
+  const parts: Buffer[] = [];
+  const CHUNK = 65515;
+  for (let i = 0; i < pack.length; i += CHUNK) {
+    const piece = pack.subarray(i, Math.min(pack.length, i + CHUNK));
+    parts.push(pktLine(Buffer.concat([Buffer.from([1]), piece])));
+  }
+  return Buffer.concat(parts);
+}
+
+function rawPackLines(pack: Buffer): Buffer {
+  const parts: Buffer[] = [];
+  const CHUNK = 65516;
+  for (let i = 0; i < pack.length; i += CHUNK) {
+    parts.push(pktLine(pack.subarray(i, Math.min(pack.length, i + CHUNK))));
+  }
+  return Buffer.concat(parts);
+}
+
+interface FetchRequest {
+  wants: string[];
+  haves: Set<string>;
+  depth: number | null;
+  deepen: number | null;
+  clientShallow: Set<string>;
+  caps: string;
+}
+
+function parseV0Fetch(body: Buffer): FetchRequest {
+  const req: FetchRequest = { wants: [], haves: new Set(), depth: null, deepen: null, clientShallow: new Set(), caps: '' };
+  const { items } = parsePktLines(body);
+  for (const item of items) {
+    if (item.flush) break;
+    if (!item.data) continue;
+    let line = item.data.toString('utf8');
+    const nul = line.indexOf('\0');
+    if (nul !== -1) {
+      if (req.caps === '') req.caps = line.slice(nul + 1);
+      line = line.slice(0, nul);
+    }
+    line = line.trim();
+    if (line.startsWith('want ')) req.wants.push(line.slice(5).trim().split(' ')[0]);
+    else if (line.startsWith('have ')) req.haves.add(line.slice(5).trim());
+    else if (line.startsWith('deepen ')) req.deepen = parseInt(line.slice(7).trim(), 10);
+    else if (line.startsWith('shallow ')) req.clientShallow.add(line.slice(8).trim());
+    else if (line.startsWith('filter ')) {
+      // filter is accepted and ignored: the full object set is sent
+    }
+  }
+  return req;
+}
+
+function uploadPackV0(repo: Repo, body: Buffer): Buffer {
+  const req = parseV0Fetch(body);
+  if (req.wants.length === 0) return Buffer.concat([FLUSH]);
+  const plan = planFetch(repo, req.wants, req.haves, null, req.deepen, req.clientShallow);
+  const pack = writePack(plan);
+  const parts: Buffer[] = [];
+  for (const oid of plan.shallow) parts.push(pktLine('shallow ' + oid + '\n'));
+  for (const oid of plan.unshallow) parts.push(pktLine('unshallow ' + oid + '\n'));
+  if (req.haves.size === 0) {
+    parts.push(pktLine('NAK\n'));
+  } else {
+    const wantAncestors = new Set<string>();
+    for (const want of req.wants) {
+      for (const anc of ancestorsSet(repo, want)) wantAncestors.add(anc);
+    }
+    let acked = 0;
+    for (const have of req.haves) {
+      if (wantAncestors.has(have)) {
+        parts.push(pktLine('ACK ' + have + '\n'));
+        acked += 1;
+      }
+    }
+    if (acked === 0) parts.push(pktLine('NAK\n'));
+    else parts.push(pktLine('NAK\n'));
+  }
+  if (req.caps.includes('side-band-64k') || req.caps.includes('side-band')) {
+    parts.push(sidebandPack(pack));
+    parts.push(FLUSH);
+  } else {
+    parts.push(pack);
+  }
+  return Buffer.concat(parts);
+}
+
+function lsRefsV2(repo: Repo, args: string[]): Buffer {
+  const prefixes: string[] = [];
+  let symrefs = false;
+  let unborn = false;
+  for (const arg of args) {
+    if (arg.startsWith('ref-prefix ')) prefixes.push(arg.slice('ref-prefix '.length));
+    else if (arg === 'symrefs') symrefs = true;
+    else if (arg === 'unborn') unborn = true;
+  }
+  const parts: Buffer[] = [];
+  const refs = sortedRefs(repo);
+  const matches = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
+  if (refs.length === 0) {
+    if (unborn) parts.push(pktLine(ZERO_OID + ' HEAD symref-target:refs/heads/main unborn\n'));
+  } else {
+    const headTarget = repo.defaultBranch ? 'refs/heads/' + repo.defaultBranch : 'refs/heads/main';
+    const headOid = repo.refs.get(headTarget);
+    if (headOid && (symrefs || matches('HEAD'))) {
+      parts.push(pktLine(headOid + ' HEAD symref-target:' + headTarget + '\n'));
+    }
+    for (const ref of refs) {
+      if (matches(ref.name)) parts.push(pktLine(ref.oid + ' ' + ref.name + '\n'));
+    }
+  }
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
+}
+
+function fetchV2(repo: Repo, args: string[]): Buffer {
+  const wants: string[] = [];
+  const haves = new Set<string>();
+  let deepen: number | null = null;
+  const clientShallow = new Set<string>();
+  for (const arg of args) {
+    if (arg.startsWith('want ')) wants.push(arg.slice(5).trim());
+    else if (arg.startsWith('have ')) haves.add(arg.slice(5).trim());
+    else if (arg.startsWith('deepen ')) deepen = parseInt(arg.slice(7).trim(), 10);
+    else if (arg.startsWith('shallow ')) clientShallow.add(arg.slice(8).trim());
+  }
+  if (wants.length === 0) return Buffer.concat([FLUSH]);
+  const plan = planFetch(repo, wants, haves, null, deepen, clientShallow);
+  const pack = writePack(plan);
+  const parts: Buffer[] = [];
+  if (haves.size > 0) {
+    parts.push(pktLine('acknowledgments\n'));
+    const wantAncestors = new Set<string>();
+    for (const want of wants) {
+      for (const anc of ancestorsSet(repo, want)) wantAncestors.add(anc);
+    }
+    let acked = false;
+    for (const have of haves) {
+      if (wantAncestors.has(have)) {
+        parts.push(pktLine('ACK ' + have + '\n'));
+        acked = true;
+      }
+    }
+    if (!acked) parts.push(pktLine('NAK\n'));
+    parts.push(pktLine('ready\n'));
+    parts.push(Buffer.from('0001', 'ascii'));
+  }
+  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
+    parts.push(pktLine('shallow-info\n'));
+    for (const oid of plan.shallow) parts.push(pktLine('shallow ' + oid + '\n'));
+    for (const oid of plan.unshallow) parts.push(pktLine('unshallow ' + oid + '\n'));
+    parts.push(Buffer.from('0001', 'ascii'));
+  }
+  parts.push(pktLine('packfile\n'));
+  parts.push(sidebandPack(pack));
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
+}
+
+function uploadPackV2(repo: Repo, body: Buffer): Buffer {
+  const out: Buffer[] = [];
+  let off = 0;
+  while (off + 4 <= body.length) {
+    const len = parseInt(body.subarray(off, off + 4).toString('ascii'), 16);
+    if (Number.isNaN(len) || len < 4 || off + len > body.length) {
+      // A 0001 delimiter line between sections: skip it.
+      if (len === 1) {
+        off += 4;
+        continue;
+      }
+      break;
+    }
+    const line = body.subarray(off + 4, off + len).toString('utf8').trim();
+    off += len;
+    if (!line.startsWith('command=')) break;
+    const command = line.slice('command='.length);
+    const args: string[] = [];
+    for (;;) {
+      if (off + 4 > body.length) break;
+      const alen = parseInt(body.subarray(off, off + 4).toString('ascii'), 16);
+      if (Number.isNaN(alen)) {
+        off = body.length;
+        break;
+      }
+      if (alen === 1) {
+        // delimiter: arguments follow it
+        off += 4;
+        continue;
+      }
+      if (alen === 0) {
+        off += 4;
+        break;
+      }
+      if (alen < 4 || off + alen > body.length) {
+        off = body.length;
+        break;
+      }
+      args.push(body.subarray(off + 4, off + alen).toString('utf8').trim());
+      off += alen;
+    }
+    if (command === 'ls-refs') out.push(lsRefsV2(repo, args));
+    else if (command === 'fetch') out.push(fetchV2(repo, args));
+    else out.push(Buffer.concat([FLUSH]));
+  }
+  return Buffer.concat(out);
+}
+
+// ---------------------------------------------------------------- receive-pack
+
+interface PushCommand {
+  oldOid: string;
+  newOid: string;
+  ref: string;
+}
+
+function parseReceiveCommands(body: Buffer): { commands: PushCommand[]; caps: string; packStart: number } {
+  const commands: PushCommand[] = [];
+  let caps = '';
+  let off = 0;
+  for (;;) {
+    if (off + 4 > body.length) break;
+    const lenText = body.subarray(off, off + 4).toString('ascii');
+    const len = parseInt(lenText, 16);
+    if (Number.isNaN(len)) break;
+    if (len === 0) {
+      off += 4;
+      break;
+    }
+    if (len < 4 || off + len > body.length) break;
+    let line = body.subarray(off + 4, off + len).toString('utf8');
+    off += len;
+    const nul = line.indexOf('\0');
+    if (nul !== -1) {
+      if (caps === '') caps = line.slice(nul + 1);
+      line = line.slice(0, nul);
+    }
+    line = line.trim();
+    const parts = line.split(' ');
+    if (parts.length >= 3) commands.push({ oldOid: parts[0], newOid: parts[1], ref: parts[2] });
+  }
+  return { commands, caps, packStart: off };
+}
+
+function receivePack(repo: Repo, body: Buffer): Buffer {
+  const { commands, caps, packStart } = parseReceiveCommands(body);
+  let unpackError: string | null = null;
+  if (packStart < body.length) {
+    try {
+      readPack(repo, body.subarray(packStart));
+    } catch (err) {
+      unpackError = err instanceof Error ? err.message : 'unpack failed';
+    }
+  }
+  const lines: string[] = [];
+  if (unpackError) lines.push('unpack ' + unpackError + '\n');
+  else lines.push('unpack ok\n');
+  for (const cmd of commands) {
+    const current = repo.refs.get(cmd.ref) ?? null;
+    if (unpackError) {
+      lines.push('ng ' + cmd.ref + ' unpack failed\n');
+      continue;
+    }
+    if (cmd.newOid === ZERO_OID) {
+      if (!current) lines.push('ng ' + cmd.ref + ' remote ref does not exist\n');
+      else {
+        deleteRef(repo, cmd.ref);
+        lines.push('ok ' + cmd.ref + '\n');
+      }
+      continue;
+    }
+    const newRec = getObject(repo, cmd.newOid);
+    if (!newRec || (newRec.type !== 'commit' && newRec.type !== 'tag')) {
+      lines.push('ng ' + cmd.ref + ' unable to find commit\n');
+      continue;
+    }
+    if (cmd.oldOid === ZERO_OID) {
+      if (current) lines.push('ng ' + cmd.ref + ' already exists\n');
+      else {
+        setRef(repo, cmd.ref, cmd.newOid);
+        lines.push('ok ' + cmd.ref + '\n');
+      }
+      continue;
+    }
+    if (current !== cmd.oldOid) {
+      lines.push('ng ' + cmd.ref + ' non-fast-forward\n');
+      continue;
+    }
+    if (!isAncestor(repo, cmd.oldOid, cmd.newOid)) {
+      lines.push('ng ' + cmd.ref + ' non-fast-forward\n');
+      continue;
+    }
+    setRef(repo, cmd.ref, cmd.newOid);
+    lines.push('ok ' + cmd.ref + '\n');
+  }
+  const useSideband = caps.includes('side-band-64k') || caps.includes('side-band');
+  // The status report is itself pkt-line framed; when side-band-64k is in
+  // effect the whole framed block rides inside sideband packets (channel
+  // byte 1), so the demultiplexed stream parses as pkt-lines again.
+  const blockParts: Buffer[] = [];
+  for (const line of lines) blockParts.push(pktLine(line));
+  blockParts.push(FLUSH);
+  const block = Buffer.concat(blockParts);
+  if (!useSideband) return block;
+  const parts: Buffer[] = [];
+  const CHUNK = 65515;
+  for (let i = 0; i < block.length; i += CHUNK) {
+    parts.push(pktLine(Buffer.concat([Buffer.from([1]), block.subarray(i, Math.min(block.length, i + CHUNK))])));
+  }
+  // A flush pkt-line after the sideband packet ends the sideband stream.
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
+}
+
+// ---------------------------------------------------------------- dispatcher
+
+export interface GitResult {
   status: number;
-  contentType: string;
+  headers: Record<string, string>;
   body: Buffer;
 }
 
-function jsonResponse(status: number, obj: unknown): GitResponse {
-  return { status, contentType: 'application/json', body: Buffer.from(JSON.stringify(obj), 'utf8') };
+function jsonResult(status: number, message: string): GitResult {
+  return { status, headers: { 'content-type': 'application/json' }, body: Buffer.from(JSON.stringify({ message }), 'utf8') };
 }
 
-function resolveRepo(store: Store, ownerLogin: string, repoName: string): Repo | null {
-  if (!store.ownerMatches(ownerLogin)) return null;
-  return store.getRepo(repoName) ?? null;
-}
-
-export function gitInfoRefs(
+export function handleGit(
   store: Store,
-  ownerLogin: string,
+  method: string,
+  owner: string,
   repoName: string,
-  service: string,
-  gitProtocol: string,
-): GitResponse {
-  const repo = resolveRepo(store, ownerLogin, repoName);
-  if (!repo) return jsonResponse(404, { message: 'Repository not found' });
-  if (service === 'git-upload-pack') {
-    if (gitProtocol === 'version=2') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v2Advert() };
-    }
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: v0UploadAdvert(repo) };
-  }
-  if (service === 'git-receive-pack') {
-    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: v0ReceiveAdvert(repo) };
-  }
-  return jsonResponse(404, { message: 'Unknown service' });
-}
-
-function handleUploadPackV0(store: Store, repo: Repo, body: Buffer): Buffer {
-  const { items } = parsePktLines(body);
-  const wants: string[] = [];
-  const haves: string[] = [];
-  const shallowIn: string[] = [];
-  let deepen: number | null = null;
-  let deepenRelative = false;
-  let done = false;
-  for (const it of items) {
-    if (it.kind !== 'line' || !it.text) continue;
-    const t = it.text.replace(/\n$/, '');
-    if (t.startsWith('want ')) {
-      const parts = t.split(' ');
-      if (parts[1]) wants.push(parts[1]);
-      if (parts.includes('deepen-relative')) deepenRelative = true;
-    } else if (t.startsWith('have ')) {
-      haves.push(t.slice(5).trim());
-    } else if (t.startsWith('shallow ')) {
-      shallowIn.push(t.slice(8).trim());
-    } else if (t.startsWith('deepen ')) {
-      const n = parseInt(t.slice(7).trim(), 10);
-      if (!Number.isNaN(n)) deepen = n;
-    } else if (t === 'done') {
-      done = true;
-    }
-  }
-  void deepenRelative;
-  const plan = planFetch(store, repo, { wants, haves, shallowIn, deepen });
-  const chunks: Buffer[] = [];
-  if (!done) {
-    // Negotiation round: shallow info + ACKs, no pack yet.
-    for (const s of plan.shallow) chunks.push(pktLine(`shallow ${s}`));
-    for (const s of plan.unshallow) chunks.push(pktLine(`unshallow ${s}`));
-    for (const h of plan.commonHaves) chunks.push(pktLine(`ACK ${h} common\n`));
-    if (haves.length > 0 && plan.commonHaves.length === 0) chunks.push(pktLine('NAK\n'));
-    chunks.push(FLUSH);
-    return Buffer.concat(chunks);
-  }
-  for (const s of plan.shallow) chunks.push(pktLine(`shallow ${s}`));
-  for (const s of plan.unshallow) chunks.push(pktLine(`unshallow ${s}`));
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) chunks.push(FLUSH);
-  if (plan.commonHaves.length === 0) chunks.push(pktLine('NAK\n'));
-  else for (const h of plan.commonHaves) chunks.push(pktLine(`ACK ${h} common\n`));
-  chunks.push(sideBand(writePack(plan.objects)));
-  chunks.push(FLUSH);
-  return Buffer.concat(chunks);
-}
-
-function parseV2Request(body: Buffer): { command: string; args: string[] } {
-  const { items } = parsePktLines(body);
-  let command = '';
-  const args: string[] = [];
-  let seenDelim = false;
-  for (const it of items) {
-    if (it.kind === 'delim') {
-      seenDelim = true;
-      continue;
-    }
-    if (it.kind !== 'line' || !it.text) continue;
-    const t = it.text.replace(/\n$/, '');
-    if (!seenDelim && t.startsWith('command=')) {
-      command = t.slice(8);
-      continue;
-    }
-    args.push(t);
-  }
-  return { command, args };
-}
-
-function handleLsRefs(store: Store, repo: Repo, args: string[]): Buffer {
-  const peel = args.includes('peel');
-  const symrefs = args.includes('symrefs');
-  const unborn = args.includes('unborn');
-  const prefixes = args.filter((a) => a.startsWith('ref-prefix ')).map((a) => a.slice('ref-prefix '.length));
-  const match = (name: string): boolean => prefixes.length === 0 || prefixes.some((p) => name.startsWith(p));
-  const chunks: Buffer[] = [];
-  const headOid = repo.refs.get(`refs/heads/${repo.defaultBranch}`);
-  if (headOid && match('HEAD')) {
-    let line = `${headOid} HEAD`;
-    if (symrefs) line += ` symref-target:refs/heads/${repo.defaultBranch}`;
-    chunks.push(pktLine(`${line}\n`));
-  } else if (!headOid && unborn && match('HEAD')) {
-    chunks.push(pktLine(`${ZERO_OID} HEAD symref-target:refs/heads/${repo.defaultBranch}\n`));
-  }
-  for (const r of sortedRefs(repo)) {
-    if (!match(r.name)) continue;
-    let line = `${r.oid} ${r.name}`;
-    if (peel) {
-      const obj = store.getObject(repo, r.oid);
-      if (obj && obj.type === 'tag') {
-        const t = parseTag(obj.content);
-        if (t.object) line += ` peeled:${t.object}`;
-      }
-    }
-    chunks.push(pktLine(`${line}\n`));
-  }
-  chunks.push(FLUSH);
-  return Buffer.concat(chunks);
-}
-
-function handleFetchV2(store: Store, repo: Repo, args: string[]): Buffer {
-  const wants: string[] = [];
-  const haves: string[] = [];
-  const shallowIn: string[] = [];
-  let deepen: number | null = null;
-  for (const a of args) {
-    if (a.startsWith('want ')) wants.push(a.slice(5).trim());
-    else if (a.startsWith('have ')) haves.push(a.slice(5).trim());
-    else if (a.startsWith('shallow ')) shallowIn.push(a.slice(8).trim());
-    else if (a.startsWith('deepen ')) {
-      const n = parseInt(a.slice(7).trim(), 10);
-      if (!Number.isNaN(n)) deepen = n;
-    }
-  }
-  const plan = planFetch(store, repo, { wants, haves, shallowIn, deepen });
-  const chunks: Buffer[] = [];
-  if (haves.length > 0) {
-    chunks.push(pktLine('acknowledgments\n'));
-    if (plan.commonHaves.length === 0) chunks.push(pktLine('NAK\n'));
-    else for (const h of plan.commonHaves) chunks.push(pktLine(`ACK ${h}\n`));
-    chunks.push(pktLine('ready\n'));
-    chunks.push(DELIM);
-  }
-  if (plan.shallow.length > 0 || plan.unshallow.length > 0) {
-    chunks.push(pktLine('shallow-info\n'));
-    for (const s of plan.shallow) chunks.push(pktLine(`shallow ${s}`));
-    for (const s of plan.unshallow) chunks.push(pktLine(`unshallow ${s}`));
-    chunks.push(DELIM);
-  }
-  chunks.push(pktLine('packfile\n'));
-  chunks.push(sideBand(writePack(plan.objects)));
-  chunks.push(FLUSH);
-  return Buffer.concat(chunks);
-}
-
-export function gitUploadPack(
-  store: Store,
-  ownerLogin: string,
-  repoName: string,
+  rest: string[],
+  query: URLSearchParams,
+  headers: Record<string, string | undefined>,
   body: Buffer,
-  gitProtocol: string,
-): GitResponse {
-  const repo = resolveRepo(store, ownerLogin, repoName);
-  if (!repo) return jsonResponse(404, { message: 'Repository not found' });
-  try {
-    if (gitProtocol === 'version=2') {
-      const { command, args } = parseV2Request(body);
-      if (command === 'ls-refs') {
-        return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleLsRefs(store, repo, args) };
-      }
-      if (command === 'fetch') {
-        return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleFetchV2(store, repo, args) };
-      }
-      return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat([pktLine('version 2\n'), FLUSH]) };
+): GitResult {
+  const repo = store.findRepo(owner, repoName);
+  if (!repo) return jsonResult(404, 'Repository not found');
+  if (method === 'GET' && rest.length === 2 && rest[0] === 'info' && rest[1] === 'refs') {
+    const service = query.get('service');
+    if (service === 'git-upload-pack') {
+      const v2 = (headers['git-protocol'] ?? '') === 'version=2';
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/x-git-upload-pack-advertisement' },
+        body: v2 ? v2Advert() : v0Advert('git-upload-pack', repo, UPLOAD_CAPS),
+      };
     }
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: handleUploadPackV0(store, repo, body) };
-  } catch (e) {
-    // A malformed upload-pack request must not kill the server.
-    console.error('upload-pack error:', (e as Error).message);
-    return { status: 200, contentType: 'application/x-git-upload-pack-result', body: Buffer.concat([pktLine('NAK\n'), FLUSH]) };
+    if (service === 'git-receive-pack') {
+      return {
+        status: 200,
+        headers: { 'content-type': 'application/x-git-receive-pack-advertisement' },
+        body: v0Advert('git-receive-pack', repo, RECEIVE_CAPS),
+      };
+    }
+    return jsonResult(404, 'Not Found');
   }
-}
-
-export function gitReceivePack(store: Store, ownerLogin: string, repoName: string, body: Buffer): GitResponse {
-  const repo = resolveRepo(store, ownerLogin, repoName);
-  if (!repo) return jsonResponse(404, { message: 'Repository not found' });
-  const { items, afterFirstFlush } = parsePktLines(body);
-  const updates: Array<{ old: string; nw: string; ref: string }> = [];
-  for (const it of items) {
-    if (it.kind === 'flush') break;
-    if (it.kind !== 'line' || !it.text) continue;
-    const t = it.text.replace(/\n$/, '');
-    const nul = t.indexOf('\0');
-    const main = nul === -1 ? t : t.slice(0, nul);
-    const m = /^([0-9a-f]{40}) ([0-9a-f]{40}) (\S+)$/.exec(main);
-    if (m) updates.push({ old: m[1], nw: m[2], ref: m[3] });
+  if (method === 'POST' && rest.length === 1 && rest[0] === 'git-upload-pack') {
+    const v2 = (headers['git-protocol'] ?? '') === 'version=2';
+    return {
+      status: 200,
+      headers: { 'content-type': 'application/x-git-upload-pack-result' },
+      body: v2 ? uploadPackV2(repo, body) : uploadPackV0(repo, body),
+    };
   }
-  let unpackOk = true;
-  let unpackErr = '';
-  if (afterFirstFlush !== null && afterFirstFlush < body.length) {
-    const packData = body.subarray(afterFirstFlush);
-    if (packData.length > 0) {
-      try {
-        const objs = readPack(packData, (oid) => store.getObject(repo, oid));
-        for (const o of objs) store.putObject(repo, o.type, o.content);
-      } catch (e) {
-        unpackOk = false;
-        unpackErr = (e as Error).message;
-      }
-    }
+  if (method === 'POST' && rest.length === 1 && rest[0] === 'git-receive-pack') {
+    return {
+      status: 200,
+      headers: { 'content-type': 'application/x-git-receive-pack-result' },
+      body: receivePack(repo, body),
+    };
   }
-  const report: string[] = [];
-  if (unpackOk) report.push('unpack ok\n');
-  else report.push(`unpack ${unpackErr}\n`);
-  for (const u of updates) {
-    if (!unpackOk) {
-      report.push(`ng ${u.ref} unpack failed\n`);
-      continue;
-    }
-    if (u.nw === ZERO_OID) {
-      if (repo.refs.has(u.ref)) {
-        repo.refs.delete(u.ref);
-        report.push(`ok ${u.ref}\n`);
-      } else {
-        report.push(`ng ${u.ref} remote ref does not exist\n`);
-      }
-      continue;
-    }
-    const current = repo.refs.get(u.ref);
-    if (u.old === ZERO_OID) {
-      if (current !== undefined) {
-        report.push(`ng ${u.ref} already exists\n`);
-        continue;
-      }
-    } else {
-      if (current === undefined) {
-        report.push(`ng ${u.ref} remote ref does not exist\n`);
-        continue;
-      }
-      if (current !== u.old) {
-        report.push(`ng ${u.ref} non-fast-forward\n`);
-        continue;
-      }
-      if (!store.isAncestor(repo, u.old, u.nw)) {
-        report.push(`ng ${u.ref} non-fast-forward\n`);
-        continue;
-      }
-    }
-    if (!store.hasObject(repo, u.nw)) {
-      report.push(`ng ${u.ref} object not found\n`);
-      continue;
-    }
-    repo.refs.set(u.ref, u.nw);
-    report.push(`ok ${u.ref}\n`);
-  }
-  const inner = Buffer.concat([...report.map((r) => pktLine(r)), FLUSH]);
-  return { status: 200, contentType: 'application/x-git-receive-pack-result', body: Buffer.concat([sideBand(inner), FLUSH]) };
+  return jsonResult(404, 'Not Found');
 }
